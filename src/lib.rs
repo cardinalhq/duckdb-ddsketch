@@ -5,6 +5,9 @@ extern crate libduckdb_sys;
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
+    vtab::arrow::WritableVector,
+    vscalar::{ScalarFunctionSignature, VScalar},
+    types::DuckString,
     Connection, Result,
 };
 use duckdb_loadable_macros::duckdb_entrypoint_c_api;
@@ -33,7 +36,7 @@ fn deserialize_sketch(encoded: &str) -> std::result::Result<DDSketch, Box<dyn Er
 }
 
 // ============================================================================
-// ddsketch_create: Create a new empty DDSketch
+// ddsketch_create: Create a new empty DDSketch (Table Function)
 // ============================================================================
 
 #[repr(C)]
@@ -96,470 +99,366 @@ impl VTab for CreateSketchVTab {
 }
 
 // ============================================================================
-// ddsketch_add: Add values to a sketch
+// Scalar Functions for DDSketch operations
 // ============================================================================
 
-#[repr(C)]
-struct AddBindData {
-    sketch_encoded: String,
-    values: Vec<f64>,
+// Helper to get string from input at index
+unsafe fn get_string_from_input(input: &DataChunkHandle, col: usize, row: usize) -> String {
+    use ffi::duckdb_string_t;
+
+    let values = input.flat_vector(col);
+    let strings = values.as_slice_with_len::<duckdb_string_t>(input.len());
+    DuckString::new(&mut { strings[row] }).as_str().to_string()
 }
 
-#[repr(C)]
-struct AddInitData {
-    done: std::sync::atomic::AtomicBool,
+unsafe fn get_double_from_input(input: &DataChunkHandle, col: usize, row: usize) -> f64 {
+    let values = input.flat_vector(col);
+    let doubles = values.as_slice_with_len::<f64>(input.len());
+    doubles[row]
 }
 
-struct AddToSketchVTab;
+// ============================================================================
+// ddsketch_add: Add a value to a sketch (Scalar Function)
+// ============================================================================
 
-impl VTab for AddToSketchVTab {
-    type InitData = AddInitData;
-    type BindData = AddBindData;
+struct AddScalar;
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("sketch", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+impl VScalar for AddScalar {
+    type State = ();
 
-        let sketch_encoded = bind.get_parameter(0).to_string();
-        let value = bind.get_parameter(1).to_string().parse::<f64>().unwrap_or(0.0);
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let output = output.flat_vector();
 
-        Ok(AddBindData {
-            sketch_encoded,
-            values: vec![value],
-        })
-    }
+        for row in 0..input.len() {
+            let sketch_encoded = get_string_from_input(input, 0, row);
+            let value = get_double_from_input(input, 1, row);
 
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(AddInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let mut sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
-            for value in &bind_data.values {
-                sketch.add(*value);
+            match deserialize_sketch(&sketch_encoded) {
+                Ok(mut sketch) => {
+                    sketch.add(value);
+                    let encoded = serialize_sketch(&sketch);
+                    output.insert(row, encoded.as_str());
+                }
+                Err(_) => {
+                    output.insert(row, "");
+                }
             }
-            let encoded = serialize_sketch(&sketch);
-
-            let vector = output.flat_vector(0);
-            let result = CString::new(encoded)?;
-            vector.insert(0, result);
-            output.set_len(1);
         }
         Ok(())
     }
 
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),  // sketch
-            LogicalTypeHandle::from(LogicalTypeId::Double),   // value
-        ])
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeId::Varchar.into(),  // sketch
+                LogicalTypeId::Double.into(),   // value
+            ],
+            LogicalTypeId::Varchar.into(),
+        )]
     }
 }
 
 // ============================================================================
-// ddsketch_merge: Merge two sketches
+// ddsketch_merge: Merge two sketches (Scalar Function)
 // ============================================================================
 
-#[repr(C)]
-struct MergeBindData {
-    sketch1_encoded: String,
-    sketch2_encoded: String,
-}
+struct MergeScalar;
 
-#[repr(C)]
-struct MergeInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+impl VScalar for MergeScalar {
+    type State = ();
 
-struct MergeSketchVTab;
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let output = output.flat_vector();
 
-impl VTab for MergeSketchVTab {
-    type InitData = MergeInitData;
-    type BindData = MergeBindData;
+        for row in 0..input.len() {
+            let sketch1_encoded = get_string_from_input(input, 0, row);
+            let sketch2_encoded = get_string_from_input(input, 1, row);
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("sketch", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-
-        let sketch1_encoded = bind.get_parameter(0).to_string();
-        let sketch2_encoded = bind.get_parameter(1).to_string();
-
-        Ok(MergeBindData { sketch1_encoded, sketch2_encoded })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(MergeInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let mut sketch1 = deserialize_sketch(&bind_data.sketch1_encoded)?;
-            let sketch2 = deserialize_sketch(&bind_data.sketch2_encoded)?;
-            sketch1.merge(&sketch2)?;
-            let encoded = serialize_sketch(&sketch1);
-
-            let vector = output.flat_vector(0);
-            let result = CString::new(encoded)?;
-            vector.insert(0, result);
-            output.set_len(1);
+            match (deserialize_sketch(&sketch1_encoded), deserialize_sketch(&sketch2_encoded)) {
+                (Ok(mut sketch1), Ok(sketch2)) => {
+                    if sketch1.merge(&sketch2).is_ok() {
+                        let encoded = serialize_sketch(&sketch1);
+                        output.insert(row, encoded.as_str());
+                    } else {
+                        output.insert(row, "");
+                    }
+                }
+                _ => {
+                    output.insert(row, "");
+                }
+            }
         }
         Ok(())
     }
 
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),  // sketch1
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),  // sketch2
-        ])
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeId::Varchar.into(),  // sketch1
+                LogicalTypeId::Varchar.into(),  // sketch2
+            ],
+            LogicalTypeId::Varchar.into(),
+        )]
     }
 }
 
 // ============================================================================
-// ddsketch_quantile: Get a quantile value from a sketch
+// ddsketch_quantile: Get quantile value (Scalar Function)
 // ============================================================================
 
-#[repr(C)]
-struct QuantileBindData {
-    sketch_encoded: String,
-    quantile: f64,
-}
+struct QuantileScalar;
 
-#[repr(C)]
-struct QuantileInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+impl VScalar for QuantileScalar {
+    type State = ();
 
-struct QuantileVTab;
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut output = output.flat_vector();
+        let output_slice = output.as_mut_slice::<f64>();
 
-impl VTab for QuantileVTab {
-    type InitData = QuantileInitData;
-    type BindData = QuantileBindData;
+        for row in 0..input.len() {
+            let sketch_encoded = get_string_from_input(input, 0, row);
+            let quantile = get_double_from_input(input, 1, row);
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("value", LogicalTypeHandle::from(LogicalTypeId::Double));
-
-        let sketch_encoded = bind.get_parameter(0).to_string();
-        let quantile = bind.get_parameter(1).to_string().parse::<f64>().unwrap_or(0.5);
-
-        Ok(QuantileBindData { sketch_encoded, quantile })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(QuantileInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
-            let value = sketch.quantile(bind_data.quantile)?.unwrap_or(f64::NAN);
-
-            let mut vector = output.flat_vector(0);
-            vector.as_mut_slice::<f64>()[0] = value;
-            output.set_len(1);
+            match deserialize_sketch(&sketch_encoded) {
+                Ok(sketch) => {
+                    output_slice[row] = sketch.quantile(quantile)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(f64::NAN);
+                }
+                Err(_) => {
+                    output_slice[row] = f64::NAN;
+                }
+            }
         }
         Ok(())
     }
 
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),  // sketch
-            LogicalTypeHandle::from(LogicalTypeId::Double),   // quantile (0.0-1.0)
-        ])
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeId::Varchar.into(),  // sketch
+                LogicalTypeId::Double.into(),   // quantile (0.0-1.0)
+            ],
+            LogicalTypeId::Double.into(),
+        )]
     }
 }
 
 // ============================================================================
-// ddsketch_count: Get count from a sketch
+// ddsketch_count: Get count (Scalar Function)
 // ============================================================================
 
-#[repr(C)]
-struct CountBindData {
-    sketch_encoded: String,
-}
+struct CountScalar;
 
-#[repr(C)]
-struct CountInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+impl VScalar for CountScalar {
+    type State = ();
 
-struct CountVTab;
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut output = output.flat_vector();
+        let output_slice = output.as_mut_slice::<i64>();
 
-impl VTab for CountVTab {
-    type InitData = CountInitData;
-    type BindData = CountBindData;
+        for row in 0..input.len() {
+            let sketch_encoded = get_string_from_input(input, 0, row);
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("count", LogicalTypeHandle::from(LogicalTypeId::Bigint));
-        let sketch_encoded = bind.get_parameter(0).to_string();
-        Ok(CountBindData { sketch_encoded })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(CountInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
-            let count = sketch.count() as i64;
-
-            let mut vector = output.flat_vector(0);
-            vector.as_mut_slice::<i64>()[0] = count;
-            output.set_len(1);
+            match deserialize_sketch(&sketch_encoded) {
+                Ok(sketch) => {
+                    output_slice[row] = sketch.count() as i64;
+                }
+                Err(_) => {
+                    output_slice[row] = 0;
+                }
+            }
         }
         Ok(())
     }
 
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Varchar.into()],
+            LogicalTypeId::Bigint.into(),
+        )]
     }
 }
 
 // ============================================================================
-// ddsketch_min: Get min from a sketch
+// ddsketch_min: Get min value (Scalar Function)
 // ============================================================================
 
-#[repr(C)]
-struct MinBindData {
-    sketch_encoded: String,
-}
+struct MinScalar;
 
-#[repr(C)]
-struct MinInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+impl VScalar for MinScalar {
+    type State = ();
 
-struct MinVTab;
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut output = output.flat_vector();
+        let output_slice = output.as_mut_slice::<f64>();
 
-impl VTab for MinVTab {
-    type InitData = MinInitData;
-    type BindData = MinBindData;
+        for row in 0..input.len() {
+            let sketch_encoded = get_string_from_input(input, 0, row);
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("min", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let sketch_encoded = bind.get_parameter(0).to_string();
-        Ok(MinBindData { sketch_encoded })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(MinInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
-            let value = sketch.min().unwrap_or(f64::NAN);
-
-            let mut vector = output.flat_vector(0);
-            vector.as_mut_slice::<f64>()[0] = value;
-            output.set_len(1);
+            match deserialize_sketch(&sketch_encoded) {
+                Ok(sketch) => {
+                    output_slice[row] = sketch.min().unwrap_or(f64::NAN);
+                }
+                Err(_) => {
+                    output_slice[row] = f64::NAN;
+                }
+            }
         }
         Ok(())
     }
 
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Varchar.into()],
+            LogicalTypeId::Double.into(),
+        )]
     }
 }
 
 // ============================================================================
-// ddsketch_max: Get max from a sketch
+// ddsketch_max: Get max value (Scalar Function)
 // ============================================================================
 
-#[repr(C)]
-struct MaxBindData {
-    sketch_encoded: String,
-}
+struct MaxScalar;
 
-#[repr(C)]
-struct MaxInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+impl VScalar for MaxScalar {
+    type State = ();
 
-struct MaxVTab;
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut output = output.flat_vector();
+        let output_slice = output.as_mut_slice::<f64>();
 
-impl VTab for MaxVTab {
-    type InitData = MaxInitData;
-    type BindData = MaxBindData;
+        for row in 0..input.len() {
+            let sketch_encoded = get_string_from_input(input, 0, row);
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("max", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let sketch_encoded = bind.get_parameter(0).to_string();
-        Ok(MaxBindData { sketch_encoded })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(MaxInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
-            let value = sketch.max().unwrap_or(f64::NAN);
-
-            let mut vector = output.flat_vector(0);
-            vector.as_mut_slice::<f64>()[0] = value;
-            output.set_len(1);
+            match deserialize_sketch(&sketch_encoded) {
+                Ok(sketch) => {
+                    output_slice[row] = sketch.max().unwrap_or(f64::NAN);
+                }
+                Err(_) => {
+                    output_slice[row] = f64::NAN;
+                }
+            }
         }
         Ok(())
     }
 
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Varchar.into()],
+            LogicalTypeId::Double.into(),
+        )]
     }
 }
 
 // ============================================================================
-// ddsketch_sum: Get sum from a sketch
+// ddsketch_sum: Get sum value (Scalar Function)
 // ============================================================================
 
-#[repr(C)]
-struct SumBindData {
-    sketch_encoded: String,
-}
+struct SumScalar;
 
-#[repr(C)]
-struct SumInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+impl VScalar for SumScalar {
+    type State = ();
 
-struct SumVTab;
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut output = output.flat_vector();
+        let output_slice = output.as_mut_slice::<f64>();
 
-impl VTab for SumVTab {
-    type InitData = SumInitData;
-    type BindData = SumBindData;
+        for row in 0..input.len() {
+            let sketch_encoded = get_string_from_input(input, 0, row);
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("sum", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let sketch_encoded = bind.get_parameter(0).to_string();
-        Ok(SumBindData { sketch_encoded })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(SumInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
-            let value = sketch.sum().unwrap_or(f64::NAN);
-
-            let mut vector = output.flat_vector(0);
-            vector.as_mut_slice::<f64>()[0] = value;
-            output.set_len(1);
+            match deserialize_sketch(&sketch_encoded) {
+                Ok(sketch) => {
+                    output_slice[row] = sketch.sum().unwrap_or(f64::NAN);
+                }
+                Err(_) => {
+                    output_slice[row] = f64::NAN;
+                }
+            }
         }
         Ok(())
     }
 
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Varchar.into()],
+            LogicalTypeId::Double.into(),
+        )]
     }
 }
 
 // ============================================================================
-// ddsketch_avg: Get average from a sketch
+// ddsketch_avg: Get average value (Scalar Function)
 // ============================================================================
 
-#[repr(C)]
-struct AvgBindData {
-    sketch_encoded: String,
-}
+struct AvgScalar;
 
-#[repr(C)]
-struct AvgInitData {
-    done: std::sync::atomic::AtomicBool,
-}
+impl VScalar for AvgScalar {
+    type State = ();
 
-struct AvgVTab;
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut output = output.flat_vector();
+        let output_slice = output.as_mut_slice::<f64>();
 
-impl VTab for AvgVTab {
-    type InitData = AvgInitData;
-    type BindData = AvgBindData;
+        for row in 0..input.len() {
+            let sketch_encoded = get_string_from_input(input, 0, row);
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        bind.add_result_column("avg", LogicalTypeHandle::from(LogicalTypeId::Double));
-        let sketch_encoded = bind.get_parameter(0).to_string();
-        Ok(AvgBindData { sketch_encoded })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        Ok(AvgInitData {
-            done: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-
-        if init_data.done.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
-            let count = sketch.count();
-            let value = if count > 0 {
-                sketch.sum().unwrap_or(0.0) / count as f64
-            } else {
-                f64::NAN
-            };
-
-            let mut vector = output.flat_vector(0);
-            vector.as_mut_slice::<f64>()[0] = value;
-            output.set_len(1);
+            match deserialize_sketch(&sketch_encoded) {
+                Ok(sketch) => {
+                    let count = sketch.count();
+                    output_slice[row] = if count > 0 {
+                        sketch.sum().unwrap_or(0.0) / count as f64
+                    } else {
+                        f64::NAN
+                    };
+                }
+                Err(_) => {
+                    output_slice[row] = f64::NAN;
+                }
+            }
         }
         Ok(())
     }
 
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Varchar.into()],
+            LogicalTypeId::Double.into(),
+        )]
     }
 }
 
@@ -567,36 +466,35 @@ impl VTab for AvgVTab {
 // Extension entry point
 // ============================================================================
 
-const EXTENSION_NAME: &str = "ddsketch";
-
 #[duckdb_entrypoint_c_api()]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    // Register table functions
+    // Register table function for creating sketches
     con.register_table_function::<CreateSketchVTab>("ddsketch_create")
         .expect("Failed to register ddsketch_create");
 
-    con.register_table_function::<AddToSketchVTab>("ddsketch_add")
+    // Register scalar functions
+    con.register_scalar_function::<AddScalar>("ddsketch_add")
         .expect("Failed to register ddsketch_add");
 
-    con.register_table_function::<MergeSketchVTab>("ddsketch_merge")
+    con.register_scalar_function::<MergeScalar>("ddsketch_merge")
         .expect("Failed to register ddsketch_merge");
 
-    con.register_table_function::<QuantileVTab>("ddsketch_quantile")
+    con.register_scalar_function::<QuantileScalar>("ddsketch_quantile")
         .expect("Failed to register ddsketch_quantile");
 
-    con.register_table_function::<CountVTab>("ddsketch_count")
+    con.register_scalar_function::<CountScalar>("ddsketch_count")
         .expect("Failed to register ddsketch_count");
 
-    con.register_table_function::<MinVTab>("ddsketch_min")
+    con.register_scalar_function::<MinScalar>("ddsketch_min")
         .expect("Failed to register ddsketch_min");
 
-    con.register_table_function::<MaxVTab>("ddsketch_max")
+    con.register_scalar_function::<MaxScalar>("ddsketch_max")
         .expect("Failed to register ddsketch_max");
 
-    con.register_table_function::<SumVTab>("ddsketch_sum")
+    con.register_scalar_function::<SumScalar>("ddsketch_sum")
         .expect("Failed to register ddsketch_sum");
 
-    con.register_table_function::<AvgVTab>("ddsketch_avg")
+    con.register_scalar_function::<AvgScalar>("ddsketch_avg")
         .expect("Failed to register ddsketch_avg");
 
     Ok(())

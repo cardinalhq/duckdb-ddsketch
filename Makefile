@@ -5,7 +5,7 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXTENSION_NAME=ddsketch
 
 # Set to 1 to enable Unstable API
-USE_UNSTABLE_C_API=0
+USE_UNSTABLE_C_API=1
 
 # Target DuckDB version
 TARGET_DUCKDB_VERSION=v1.4.3
