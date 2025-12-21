@@ -1,0 +1,27 @@
+# Build artifacts
+/target/
+/build/
+
+# Cargo lock (for libraries)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.db
+*.wal

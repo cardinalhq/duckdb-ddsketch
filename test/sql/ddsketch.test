@@ -1,0 +1,32 @@
+# name: test/sql/ddsketch.test
+# description: Test DDSketch extension functions
+# group: [ddsketch]
+
+require ddsketch
+
+# Test creating a sketch
+query I
+SELECT * FROM ddsketch_create(0.01);
+----
+(not empty)
+
+# Create a sketch and add some values
+statement ok
+CREATE TABLE test_sketch AS SELECT * FROM ddsketch_create(0.01);
+
+# Test getting count from empty sketch
+query I
+SELECT * FROM ddsketch_count((SELECT sketch FROM test_sketch));
+----
+0
+
+# Test getting stats from empty sketch (should return NaN or NULL)
+query I
+SELECT * FROM ddsketch_min((SELECT sketch FROM test_sketch));
+----
+nan
+
+query I
+SELECT * FROM ddsketch_max((SELECT sketch FROM test_sketch));
+----
+nan
