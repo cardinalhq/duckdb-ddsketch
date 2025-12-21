@@ -11,7 +11,6 @@ env:
   CARGO_TERM_COLOR: always
   # DuckDB v1.4.x uses C API version v1.2.0 (not the release version!)
   DUCKDB_API_VERSION: v1.2.0
-  EXTENSION_VERSION: v0.1.0
 
 jobs:
   test:
@@ -73,12 +72,18 @@ jobs:
       - name: Package extension
         run: |
           mkdir -p dist
+          # Use git tag for version if available, otherwise use commit SHA
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="dev-${{ github.sha }}"
+          fi
           python3 extension-ci-tools/scripts/append_extension_metadata.py \
             --library-file target/${{ matrix.target }}/release/libddsketch.${{ matrix.ext }} \
             --extension-name ddsketch \
             --duckdb-platform ${{ matrix.platform }} \
             --duckdb-version ${{ env.DUCKDB_API_VERSION }} \
-            --extension-version ${{ env.EXTENSION_VERSION }} \
+            --extension-version "$VERSION" \
             --out-file dist/ddsketch-${{ matrix.platform }}.duckdb_extension
 
       - name: Upload artifact
