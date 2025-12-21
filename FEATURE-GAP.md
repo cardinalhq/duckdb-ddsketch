@@ -38,7 +38,8 @@ GROUP BY metric_name
 ```
 
 Returns:
-```
+
+```sql
 STRUCT(
     sketch BLOB,
     p25 DOUBLE,
