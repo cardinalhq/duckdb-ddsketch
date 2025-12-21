@@ -463,6 +463,78 @@ impl VScalar for AvgScalar {
 }
 
 // ============================================================================
+// ddsketch_stats: Get all stats as a struct (Scalar Function)
+// ============================================================================
+
+struct StatsScalar;
+
+impl VScalar for StatsScalar {
+    type State = ();
+
+    unsafe fn invoke(
+        _state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut struct_vec = output.struct_vector();
+        let row_count = input.len();
+
+        // Get child vectors for each field
+        let mut count_vec = struct_vec.child(0, row_count);
+        let mut sum_vec = struct_vec.child(1, row_count);
+        let mut min_vec = struct_vec.child(2, row_count);
+        let mut max_vec = struct_vec.child(3, row_count);
+        let mut avg_vec = struct_vec.child(4, row_count);
+
+        let count_slice = count_vec.as_mut_slice::<i64>();
+        let sum_slice = sum_vec.as_mut_slice::<f64>();
+        let min_slice = min_vec.as_mut_slice::<f64>();
+        let max_slice = max_vec.as_mut_slice::<f64>();
+        let avg_slice = avg_vec.as_mut_slice::<f64>();
+
+        for row in 0..row_count {
+            let sketch_bytes = get_blob_from_input(input, 0, row);
+
+            match deserialize_sketch(&sketch_bytes) {
+                Ok(sketch) => {
+                    let count = sketch.count();
+                    let sum = sketch.sum().unwrap_or(f64::NAN);
+                    count_slice[row] = count as i64;
+                    sum_slice[row] = sum;
+                    min_slice[row] = sketch.min().unwrap_or(f64::NAN);
+                    max_slice[row] = sketch.max().unwrap_or(f64::NAN);
+                    avg_slice[row] = if count > 0 { sum / count as f64 } else { f64::NAN };
+                }
+                Err(_) => {
+                    count_slice[row] = 0;
+                    sum_slice[row] = f64::NAN;
+                    min_slice[row] = f64::NAN;
+                    max_slice[row] = f64::NAN;
+                    avg_slice[row] = f64::NAN;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        // Return type is a struct with 5 fields
+        let struct_type = LogicalTypeHandle::struct_type(&[
+            ("count", LogicalTypeId::Bigint.into()),
+            ("sum", LogicalTypeId::Double.into()),
+            ("min", LogicalTypeId::Double.into()),
+            ("max", LogicalTypeId::Double.into()),
+            ("avg", LogicalTypeId::Double.into()),
+        ]);
+
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into()],
+            struct_type,
+        )]
+    }
+}
+
+// ============================================================================
 // ddsketch_agg: Aggregate function to merge sketches (C API)
 // ============================================================================
 
@@ -754,6 +826,9 @@ unsafe fn extension_entrypoint_internal(
 
     con.register_scalar_function::<AvgScalar>("ddsketch_avg")
         .expect("Failed to register ddsketch_avg");
+
+    con.register_scalar_function::<StatsScalar>("ddsketch_stats")
+        .expect("Failed to register ddsketch_stats");
 
     Ok(true)
 }
