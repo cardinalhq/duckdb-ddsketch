@@ -4,11 +4,14 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 EXTENSION_NAME=ddsketch
 
-# Set to 1 to enable Unstable API
-USE_UNSTABLE_C_API=1
+# Set to 0 to use stable C API (allows loading with compatible DuckDB versions)
+# Set to 1 to pin to exact DuckDB version (for unstable API features)
+USE_UNSTABLE_C_API=0
 
-# Target DuckDB version
-TARGET_DUCKDB_VERSION=v1.4.3
+# IMPORTANT: This is the C API version, NOT the DuckDB release version!
+# DuckDB v1.4.x uses C API version v1.2.0
+# Check with: duckdb -c "PRAGMA version;" and look at what API it expects
+TARGET_DUCKDB_VERSION=v1.2.0
 
 all: configure debug
 
