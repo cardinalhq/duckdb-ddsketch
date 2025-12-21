@@ -4,11 +4,11 @@
 
 require ddsketch
 
-# Test creating a sketch
+# Test creating a sketch (verify it returns non-empty blob)
 query I
-SELECT * FROM ddsketch_create(0.01);
+SELECT octet_length(sketch) > 0 FROM ddsketch_create(0.01);
 ----
-(not empty)
+true
 
 # Create a sketch and add some values
 statement ok
@@ -16,17 +16,104 @@ CREATE TABLE test_sketch AS SELECT * FROM ddsketch_create(0.01);
 
 # Test getting count from empty sketch
 query I
-SELECT * FROM ddsketch_count((SELECT sketch FROM test_sketch));
+SELECT ddsketch_count((SELECT sketch FROM test_sketch));
 ----
 0
 
-# Test getting stats from empty sketch (should return NaN or NULL)
+# Test getting stats from empty sketch (should return NaN)
 query I
-SELECT * FROM ddsketch_min((SELECT sketch FROM test_sketch));
+SELECT ddsketch_min((SELECT sketch FROM test_sketch));
 ----
 nan
 
 query I
-SELECT * FROM ddsketch_max((SELECT sketch FROM test_sketch));
+SELECT ddsketch_max((SELECT sketch FROM test_sketch));
 ----
 nan
+
+# Add a value and verify the count
+statement ok
+UPDATE test_sketch SET sketch = ddsketch_add(sketch, 100.0);
+
+query I
+SELECT ddsketch_count((SELECT sketch FROM test_sketch));
+----
+1
+
+# Add more values
+statement ok
+UPDATE test_sketch SET sketch = ddsketch_add(sketch, 200.0);
+
+statement ok
+UPDATE test_sketch SET sketch = ddsketch_add(sketch, 300.0);
+
+query I
+SELECT ddsketch_count((SELECT sketch FROM test_sketch));
+----
+3
+
+query R
+SELECT ddsketch_sum((SELECT sketch FROM test_sketch));
+----
+600.0
+
+query R
+SELECT ddsketch_avg((SELECT sketch FROM test_sketch));
+----
+200.0
+
+query R
+SELECT ddsketch_min((SELECT sketch FROM test_sketch));
+----
+100.0
+
+query R
+SELECT ddsketch_max((SELECT sketch FROM test_sketch));
+----
+300.0
+
+# Test quantile function
+query R
+SELECT round(ddsketch_quantile((SELECT sketch FROM test_sketch), 0.5), 0);
+----
+200.0
+
+# Test merge function
+statement ok
+CREATE TABLE sketch_a AS SELECT * FROM ddsketch_create(0.01);
+
+statement ok
+UPDATE sketch_a SET sketch = ddsketch_add(sketch, 10.0);
+
+statement ok
+CREATE TABLE sketch_b AS SELECT * FROM ddsketch_create(0.01);
+
+statement ok
+UPDATE sketch_b SET sketch = ddsketch_add(sketch, 20.0);
+
+query I
+SELECT ddsketch_count(ddsketch_merge(
+    (SELECT sketch FROM sketch_a),
+    (SELECT sketch FROM sketch_b)
+));
+----
+2
+
+# Test aggregate function
+statement ok
+CREATE TABLE sketches AS
+SELECT ddsketch_add((SELECT sketch FROM ddsketch_create(0.01)), 10.0) as s
+UNION ALL
+SELECT ddsketch_add((SELECT sketch FROM ddsketch_create(0.01)), 20.0) as s
+UNION ALL
+SELECT ddsketch_add((SELECT sketch FROM ddsketch_create(0.01)), 30.0) as s;
+
+query I
+SELECT ddsketch_count(ddsketch_agg(s)) FROM sketches;
+----
+3
+
+query R
+SELECT ddsketch_sum(ddsketch_agg(s)) FROM sketches;
+----
+60.0
