@@ -319,6 +319,19 @@ FROM my_table;
 ### Build Commands
 
 ```bash
+# Build and package extension (recommended)
+make release
+
+# Extension is output to: build/release/ddsketch.duckdb_extension
+```
+
+**Note:** The Makefile uses C API version `v1.2.0`, not the DuckDB release version.
+DuckDB v1.4.x uses C API v1.2.0. This is a common gotcha.
+
+<details>
+<summary>Manual build (if not using make)</summary>
+
+```bash
 # Build the shared library
 cargo build --release
 
@@ -331,6 +344,7 @@ python3 extension-ci-tools/scripts/append_extension_metadata.py \
   --extension-version v0.1.0 \
   --out-file ddsketch.duckdb_extension
 ```
+</details>
 
 ### Platform Strings
 
