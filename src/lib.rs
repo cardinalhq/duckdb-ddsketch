@@ -476,7 +476,7 @@ impl VScalar for StatsScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
-        let mut struct_vec = output.struct_vector();
+        let struct_vec = output.struct_vector();
         let row_count = input.len();
 
         // Get child vectors for each field

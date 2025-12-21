@@ -44,6 +44,7 @@ impl FlagType {
 /// FlagMin = newSubFlag(0x22)
 /// FlagMax = newSubFlag(0x23)
 #[repr(u8)]
+#[allow(dead_code)]
 pub enum SketchFeatureSubflag {
     ZeroCount = 1,
     Sum = 0x21,     // 33
@@ -624,48 +625,62 @@ impl DataDogSketch {
     }
 
     /// Get quantile value
+    /// Matches Go's DDSketch.GetValueAtQuantile() exactly:
+    /// - rank = quantile * (count - 1)
+    /// - Uses ">" not ">=" for rank comparison (KeyAtRank uses n > rank)
+    /// - Negative bins are searched with reversed rank (negativeValueCount - 1 - rank)
     pub fn quantile(&self, q: f64) -> Option<f64> {
         if self.count == 0.0 {
             return None;
         }
 
-        if q <= 0.0 {
-            return Some(self.min);
-        }
-        if q >= 1.0 {
-            return Some(self.max);
+        if q < 0.0 || q > 1.0 {
+            return None;
         }
 
         // Use Go's formula: rank = quantile * (count - 1)
-        let rank = q * (self.count - 1.0);
+        // Explicit f64 conversion to prevent FMA operations (matches Go)
+        let rank: f64 = q * (self.count - 1.0);
 
-        // Accumulate counts to find the bin containing the rank
-        let mut cumulative = 0.0;
+        let negative_count: f64 = self.negative_bins.iter().map(|(_, c)| c).sum();
 
-        // Check negative bins (in reverse order)
-        for (index, count) in self.negative_bins.iter().rev() {
-            cumulative += count;
-            if cumulative >= rank {
-                // Convert bin index back to value
-                return Some(-self.bin_to_value(*index));
-            }
+        if rank < negative_count {
+            // Rank falls within negative store
+            // Go reverses the rank: negativeValueCount - 1 - rank
+            let neg_rank = negative_count - 1.0 - rank;
+            return Some(-self.key_at_rank(&self.negative_bins, neg_rank));
         }
 
-        // Check zero count
-        cumulative += self.zero_count;
-        if cumulative >= rank {
+        if rank < negative_count + self.zero_count {
+            // Rank falls within zero bucket
             return Some(0.0);
         }
 
-        // Check positive bins
-        for (index, count) in &self.positive_bins {
+        // Rank falls within positive store
+        // Adjust rank for positive store
+        let pos_rank = rank - self.zero_count - negative_count;
+        Some(self.key_at_rank(&self.positive_bins, pos_rank))
+    }
+
+    /// Find the bin value at the given rank within a store
+    /// Matches Go's Store.KeyAtRank() exactly - uses ">" not ">="
+    fn key_at_rank(&self, bins: &[(i32, f64)], rank: f64) -> f64 {
+        let rank = if rank < 0.0 { 0.0 } else { rank };
+        let mut cumulative = 0.0;
+
+        for (index, count) in bins {
             cumulative += count;
-            if cumulative >= rank {
-                return Some(self.bin_to_value(*index));
+            if cumulative > rank {
+                return self.bin_to_value(*index);
             }
         }
 
-        Some(self.max)
+        // Return value at max index if rank exceeds total count
+        if let Some((max_idx, _)) = bins.last() {
+            self.bin_to_value(*max_idx)
+        } else {
+            0.0
+        }
     }
 
     /// Convert bin index to value using logarithmic mapping
@@ -1137,6 +1152,94 @@ mod compatibility_tests {
         // Also verify against expected values
         assert_eq!(sketch2.count as i64, 50);
         assert!(sketch2.sum > 3700.0 && sketch2.sum < 3800.0);
+    }
+
+    // Issue #1 regression tests: Quantile extraction must match Go's GetValueAtQuantile()
+    #[test]
+    fn test_issue1_count_1_quantile() {
+        // Issue: count=1 sketches returned 0 instead of the actual value
+        // This was because rank=0 and "cumulative >= 0" was true even with zero_count=0
+        let mut sketch = DataDogSketch::new(0.01);
+        sketch.add(1.0);
+
+        let p50 = sketch.quantile(0.50).unwrap();
+        // With count=1, rank=0. Should return the bin value for 1.0, not 0
+        assert!(p50 > 0.5 && p50 < 1.5,
+            "count=1 sketch p50 should be ~1.0, got {}", p50);
+
+        // Also test with a larger value
+        let mut sketch2 = DataDogSketch::new(0.01);
+        sketch2.add(100.0);
+        let p50_2 = sketch2.quantile(0.50).unwrap();
+        assert!(approx_eq(p50_2, 100.0, 0.02),
+            "count=1 sketch with value=100 p50 should be ~100, got {}", p50_2);
+    }
+
+    #[test]
+    fn test_issue1_quantile_uses_gt_not_gte() {
+        // Issue: quantile used ">=" instead of ">" causing wrong bin selection
+        // Go's KeyAtRank uses "n > rank" not "n >= rank"
+        let mut sketch = DataDogSketch::new(0.01);
+        for i in 1..=10 {
+            sketch.add(i as f64);
+        }
+
+        // count=10, p50: rank = 0.5 * 9 = 4.5
+        // With ">": cumulative must exceed 4.5, so we need cumulative=5, returning bin5 (value ~5)
+        // With ">=": cumulative=5 >= 4.5 would return bin5, but cumulative=4.5 >= 4.5 is also true
+        // The key test is p50 should be ~5, not ~4
+        let p50 = sketch.quantile(0.50).unwrap();
+        assert!(p50 >= 4.5 && p50 <= 5.5,
+            "p50 should be ~5.0, got {}", p50);
+
+        // Go test vector verification: sequential 1-10 has p50 ≈ 5.0
+        assert!(approx_eq(p50, 5.002829575110703, 0.05),
+            "p50 should match Go's ~5.0, got {}", p50);
+    }
+
+    #[test]
+    fn test_issue1_go_sketch_quantile() {
+        // Test with an actual Go-generated sketch (values 51-100, count=50)
+        let hex_str = "02fd4a815abf52f03f00000000000000000d238803020202020202020203020202030202030202030203020302030302030303020303030302";
+        let bytes = from_hex(hex_str);
+        let sketch = DataDogSketch::decode(&bytes).unwrap();
+
+        assert_eq!(sketch.count as i64, 50);
+
+        // p50 for values 51-100 should be around 75
+        let p50 = sketch.quantile(0.50).unwrap();
+        assert!(p50 >= 73.0 && p50 <= 77.0,
+            "p50 for 51-100 should be ~75, got {}", p50);
+
+        // p0 should be min (~51)
+        let p0 = sketch.quantile(0.0);
+        // For q=0, we should get the min value
+        assert!(p0.is_some());
+
+        // p100 should be max (~100)
+        let p100 = sketch.quantile(1.0);
+        assert!(p100.is_some());
+    }
+
+    #[test]
+    fn test_issue1_boundary_quantiles() {
+        // Test boundary conditions
+        let mut sketch = DataDogSketch::new(0.01);
+        for i in 1..=5 {
+            sketch.add(i as f64);
+        }
+
+        // q=0 should return min
+        let q0 = sketch.quantile(0.0);
+        assert!(q0.is_some());
+
+        // q=1 should return max
+        let q1 = sketch.quantile(1.0);
+        assert!(q1.is_some());
+
+        // Invalid quantiles should return None
+        assert!(sketch.quantile(-0.1).is_none());
+        assert!(sketch.quantile(1.1).is_none());
     }
 }
 
