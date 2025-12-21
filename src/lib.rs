@@ -36,8 +36,9 @@ use std::{
 // ============================================================================
 
 /// Serialize a DDSketch to DataDog wire format bytes
-fn serialize_sketch(sketch: &DataDogSketch) -> Vec<u8> {
-    sketch.encode().expect("Failed to serialize sketch")
+/// Returns None on encoding failure instead of panicking
+fn serialize_sketch(sketch: &DataDogSketch) -> Option<Vec<u8>> {
+    sketch.encode().ok()
 }
 
 /// Deserialize a DDSketch from DataDog wire format bytes
@@ -92,12 +93,16 @@ impl VTab for CreateSketchVTab {
             output.set_len(0);
         } else {
             let sketch = DataDogSketch::new(bind_data.relative_accuracy);
-            let bytes = serialize_sketch(&sketch);
-
-            // Use Inserter<&[u8]> to assign blob data
-            let vector = output.flat_vector(0);
-            vector.insert(0, bytes.as_slice());
-            output.set_len(1);
+            match serialize_sketch(&sketch) {
+                Some(bytes) => {
+                    let vector = output.flat_vector(0);
+                    vector.insert(0, bytes.as_slice());
+                    output.set_len(1);
+                }
+                None => {
+                    return Err("Failed to serialize sketch".into());
+                }
+            }
         }
         Ok(())
     }
@@ -111,7 +116,13 @@ impl VTab for CreateSketchVTab {
 // Scalar Functions for DDSketch operations
 // ============================================================================
 
-// Helper to get blob data from input at index
+// Helper to check if a row is valid (not NULL) in a given column
+unsafe fn is_row_valid(input: &DataChunkHandle, col: usize, row: usize) -> bool {
+    let vector = input.flat_vector(col);
+    !vector.row_is_null(row as u64)
+}
+
+// Helper to get blob data from input at index (caller must check validity first)
 unsafe fn get_blob_from_input(input: &DataChunkHandle, col: usize, row: usize) -> Vec<u8> {
     let values = input.flat_vector(col);
     let strings = values.as_slice_with_len::<ffi::duckdb_string_t>(input.len());
@@ -126,6 +137,7 @@ unsafe fn get_blob_from_input(input: &DataChunkHandle, col: usize, row: usize) -
     std::slice::from_raw_parts(data_ptr as *const u8, len).to_vec()
 }
 
+// Helper to get double from input (caller must check validity first)
 unsafe fn get_double_from_input(input: &DataChunkHandle, col: usize, row: usize) -> f64 {
     let values = input.flat_vector(col);
     let doubles = values.as_slice_with_len::<f64>(input.len());
@@ -136,6 +148,12 @@ unsafe fn get_double_from_input(input: &DataChunkHandle, col: usize, row: usize)
 unsafe fn set_blob_in_output(output: &mut dyn WritableVector, row: usize, data: &[u8]) {
     let vector = output.flat_vector();
     vector.insert(row, data);
+}
+
+// Helper to set a row as NULL in output
+unsafe fn set_null_in_output(output: &mut dyn WritableVector, row: usize) {
+    let mut vector = output.flat_vector();
+    vector.set_null(row);
 }
 
 // ============================================================================
@@ -153,17 +171,25 @@ impl VScalar for AddScalar {
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
         for row in 0..input.len() {
+            // Check if either input is NULL
+            if !is_row_valid(input, 0, row) || !is_row_valid(input, 1, row) {
+                set_null_in_output(output, row);
+                continue;
+            }
+
             let sketch_bytes = get_blob_from_input(input, 0, row);
             let value = get_double_from_input(input, 1, row);
 
             match deserialize_sketch(&sketch_bytes) {
                 Ok(mut sketch) => {
                     sketch.add(value);
-                    let bytes = serialize_sketch(&sketch);
-                    set_blob_in_output(output, row, &bytes);
+                    match serialize_sketch(&sketch) {
+                        Some(bytes) => set_blob_in_output(output, row, &bytes),
+                        None => set_null_in_output(output, row),
+                    }
                 }
                 Err(_) => {
-                    set_blob_in_output(output, row, &[]);
+                    set_null_in_output(output, row);
                 }
             }
         }
@@ -196,20 +222,28 @@ impl VScalar for MergeScalar {
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
         for row in 0..input.len() {
+            // Check if either input is NULL
+            if !is_row_valid(input, 0, row) || !is_row_valid(input, 1, row) {
+                set_null_in_output(output, row);
+                continue;
+            }
+
             let sketch1_bytes = get_blob_from_input(input, 0, row);
             let sketch2_bytes = get_blob_from_input(input, 1, row);
 
             match (deserialize_sketch(&sketch1_bytes), deserialize_sketch(&sketch2_bytes)) {
                 (Ok(mut sketch1), Ok(sketch2)) => {
                     if sketch1.merge(&sketch2).is_ok() {
-                        let bytes = serialize_sketch(&sketch1);
-                        set_blob_in_output(output, row, &bytes);
+                        match serialize_sketch(&sketch1) {
+                            Some(bytes) => set_blob_in_output(output, row, &bytes),
+                            None => set_null_in_output(output, row),
+                        }
                     } else {
-                        set_blob_in_output(output, row, &[]);
+                        set_null_in_output(output, row);
                     }
                 }
                 _ => {
-                    set_blob_in_output(output, row, &[]);
+                    set_null_in_output(output, row);
                 }
             }
         }
@@ -241,19 +275,27 @@ impl VScalar for QuantileScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
-        let mut output = output.flat_vector();
-        let output_slice = output.as_mut_slice::<f64>();
+        let mut out_vec = output.flat_vector();
 
         for row in 0..input.len() {
+            // Check if either input is NULL
+            if !is_row_valid(input, 0, row) || !is_row_valid(input, 1, row) {
+                out_vec.set_null(row);
+                continue;
+            }
+
             let sketch_bytes = get_blob_from_input(input, 0, row);
             let quantile = get_double_from_input(input, 1, row);
 
             match deserialize_sketch(&sketch_bytes) {
                 Ok(sketch) => {
-                    output_slice[row] = sketch.quantile(quantile).unwrap_or(f64::NAN);
+                    match sketch.quantile(quantile) {
+                        Some(val) => out_vec.as_mut_slice::<f64>()[row] = val,
+                        None => out_vec.set_null(row),
+                    }
                 }
                 Err(_) => {
-                    output_slice[row] = f64::NAN;
+                    out_vec.set_null(row);
                 }
             }
         }
@@ -285,18 +327,23 @@ impl VScalar for CountScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
-        let mut output = output.flat_vector();
-        let output_slice = output.as_mut_slice::<i64>();
+        let mut out_vec = output.flat_vector();
 
         for row in 0..input.len() {
+            // Check if input is NULL
+            if !is_row_valid(input, 0, row) {
+                out_vec.set_null(row);
+                continue;
+            }
+
             let sketch_bytes = get_blob_from_input(input, 0, row);
 
             match deserialize_sketch(&sketch_bytes) {
                 Ok(sketch) => {
-                    output_slice[row] = sketch.count() as i64;
+                    out_vec.as_mut_slice::<i64>()[row] = sketch.count() as i64;
                 }
                 Err(_) => {
-                    output_slice[row] = 0;
+                    out_vec.set_null(row);
                 }
             }
         }
@@ -325,18 +372,26 @@ impl VScalar for MinScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
-        let mut output = output.flat_vector();
-        let output_slice = output.as_mut_slice::<f64>();
+        let mut out_vec = output.flat_vector();
 
         for row in 0..input.len() {
+            // Check if input is NULL
+            if !is_row_valid(input, 0, row) {
+                out_vec.set_null(row);
+                continue;
+            }
+
             let sketch_bytes = get_blob_from_input(input, 0, row);
 
             match deserialize_sketch(&sketch_bytes) {
                 Ok(sketch) => {
-                    output_slice[row] = sketch.min().unwrap_or(f64::NAN);
+                    match sketch.min() {
+                        Some(val) => out_vec.as_mut_slice::<f64>()[row] = val,
+                        None => out_vec.set_null(row),
+                    }
                 }
                 Err(_) => {
-                    output_slice[row] = f64::NAN;
+                    out_vec.set_null(row);
                 }
             }
         }
@@ -365,18 +420,26 @@ impl VScalar for MaxScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
-        let mut output = output.flat_vector();
-        let output_slice = output.as_mut_slice::<f64>();
+        let mut out_vec = output.flat_vector();
 
         for row in 0..input.len() {
+            // Check if input is NULL
+            if !is_row_valid(input, 0, row) {
+                out_vec.set_null(row);
+                continue;
+            }
+
             let sketch_bytes = get_blob_from_input(input, 0, row);
 
             match deserialize_sketch(&sketch_bytes) {
                 Ok(sketch) => {
-                    output_slice[row] = sketch.max().unwrap_or(f64::NAN);
+                    match sketch.max() {
+                        Some(val) => out_vec.as_mut_slice::<f64>()[row] = val,
+                        None => out_vec.set_null(row),
+                    }
                 }
                 Err(_) => {
-                    output_slice[row] = f64::NAN;
+                    out_vec.set_null(row);
                 }
             }
         }
@@ -405,18 +468,26 @@ impl VScalar for SumScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
-        let mut output = output.flat_vector();
-        let output_slice = output.as_mut_slice::<f64>();
+        let mut out_vec = output.flat_vector();
 
         for row in 0..input.len() {
+            // Check if input is NULL
+            if !is_row_valid(input, 0, row) {
+                out_vec.set_null(row);
+                continue;
+            }
+
             let sketch_bytes = get_blob_from_input(input, 0, row);
 
             match deserialize_sketch(&sketch_bytes) {
                 Ok(sketch) => {
-                    output_slice[row] = sketch.sum().unwrap_or(f64::NAN);
+                    match sketch.sum() {
+                        Some(val) => out_vec.as_mut_slice::<f64>()[row] = val,
+                        None => out_vec.set_null(row),
+                    }
                 }
                 Err(_) => {
-                    output_slice[row] = f64::NAN;
+                    out_vec.set_null(row);
                 }
             }
         }
@@ -445,23 +516,28 @@ impl VScalar for AvgScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
-        let mut output = output.flat_vector();
-        let output_slice = output.as_mut_slice::<f64>();
+        let mut out_vec = output.flat_vector();
 
         for row in 0..input.len() {
+            // Check if input is NULL
+            if !is_row_valid(input, 0, row) {
+                out_vec.set_null(row);
+                continue;
+            }
+
             let sketch_bytes = get_blob_from_input(input, 0, row);
 
             match deserialize_sketch(&sketch_bytes) {
                 Ok(sketch) => {
                     let count = sketch.count();
-                    output_slice[row] = if count > 0 {
-                        sketch.sum().unwrap_or(0.0) / count as f64
+                    if count > 0 {
+                        out_vec.as_mut_slice::<f64>()[row] = sketch.sum().unwrap_or(0.0) / count as f64;
                     } else {
-                        f64::NAN
-                    };
+                        out_vec.set_null(row);
+                    }
                 }
                 Err(_) => {
-                    output_slice[row] = f64::NAN;
+                    out_vec.set_null(row);
                 }
             }
         }
@@ -490,7 +566,7 @@ impl VScalar for StatsScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn Error>> {
-        let struct_vec = output.struct_vector();
+        let mut struct_vec = output.struct_vector();
         let row_count = input.len();
 
         // Get child vectors for each field
@@ -500,31 +576,28 @@ impl VScalar for StatsScalar {
         let mut max_vec = struct_vec.child(3, row_count);
         let mut avg_vec = struct_vec.child(4, row_count);
 
-        let count_slice = count_vec.as_mut_slice::<i64>();
-        let sum_slice = sum_vec.as_mut_slice::<f64>();
-        let min_slice = min_vec.as_mut_slice::<f64>();
-        let max_slice = max_vec.as_mut_slice::<f64>();
-        let avg_slice = avg_vec.as_mut_slice::<f64>();
-
         for row in 0..row_count {
+            // Check if input is NULL
+            if !is_row_valid(input, 0, row) {
+                // Set all struct fields as NULL for this row
+                struct_vec.set_null(row);
+                continue;
+            }
+
             let sketch_bytes = get_blob_from_input(input, 0, row);
 
             match deserialize_sketch(&sketch_bytes) {
                 Ok(sketch) => {
                     let count = sketch.count();
                     let sum = sketch.sum().unwrap_or(f64::NAN);
-                    count_slice[row] = count as i64;
-                    sum_slice[row] = sum;
-                    min_slice[row] = sketch.min().unwrap_or(f64::NAN);
-                    max_slice[row] = sketch.max().unwrap_or(f64::NAN);
-                    avg_slice[row] = if count > 0 { sum / count as f64 } else { f64::NAN };
+                    count_vec.as_mut_slice::<i64>()[row] = count as i64;
+                    sum_vec.as_mut_slice::<f64>()[row] = sum;
+                    min_vec.as_mut_slice::<f64>()[row] = sketch.min().unwrap_or(f64::NAN);
+                    max_vec.as_mut_slice::<f64>()[row] = sketch.max().unwrap_or(f64::NAN);
+                    avg_vec.as_mut_slice::<f64>()[row] = if count > 0 { sum / count as f64 } else { f64::NAN };
                 }
                 Err(_) => {
-                    count_slice[row] = 0;
-                    sum_slice[row] = f64::NAN;
-                    min_slice[row] = f64::NAN;
-                    max_slice[row] = f64::NAN;
-                    avg_slice[row] = f64::NAN;
+                    struct_vec.set_null(row);
                 }
             }
         }
@@ -699,28 +772,32 @@ unsafe extern "C" fn sketch_agg_finalize(
     count: ffi::idx_t,
     _offset: ffi::idx_t,
 ) {
+    let validity = ffi::duckdb_vector_get_validity(result);
+
     for i in 0..count as usize {
         let state_ptr = *source.add(i) as *mut SketchAggState;
         let state = &*state_ptr;
 
         match state.get_sketch() {
             Some(sketch) => {
-                let bytes = serialize_sketch(sketch);
-                ffi::duckdb_vector_assign_string_element_len(
-                    result,
-                    i as ffi::idx_t,
-                    bytes.as_ptr() as *const std::ffi::c_char,
-                    bytes.len() as ffi::idx_t,
-                );
+                match serialize_sketch(sketch) {
+                    Some(bytes) => {
+                        ffi::duckdb_vector_assign_string_element_len(
+                            result,
+                            i as ffi::idx_t,
+                            bytes.as_ptr() as *const std::ffi::c_char,
+                            bytes.len() as ffi::idx_t,
+                        );
+                    }
+                    None => {
+                        // Set NULL on encoding failure
+                        ffi::duckdb_validity_set_row_invalid(validity, i as ffi::idx_t);
+                    }
+                }
             }
             None => {
                 // Return NULL for empty aggregation
-                ffi::duckdb_vector_assign_string_element_len(
-                    result,
-                    i as ffi::idx_t,
-                    std::ptr::null(),
-                    0,
-                );
+                ffi::duckdb_validity_set_row_invalid(validity, i as ffi::idx_t);
             }
         }
     }

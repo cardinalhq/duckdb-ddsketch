@@ -601,6 +601,11 @@ impl DataDogSketch {
             return Err("Cannot merge sketches with different gamma values".into());
         }
 
+        // Check index_offset compatibility (must be same to avoid silent corruption)
+        if (self.index_offset - other.index_offset).abs() > 1e-10 {
+            return Err("Cannot merge sketches with different index_offset values".into());
+        }
+
         // Merge positive bins
         self.positive_bins = Self::merge_bins_impl(&self.positive_bins, &other.positive_bins);
 
@@ -894,6 +899,33 @@ mod tests {
         assert_eq!(sketch1.sum, 100.0);
         assert_eq!(sketch1.min, 10.0);
         assert_eq!(sketch1.max, 40.0);
+    }
+
+    #[test]
+    fn test_sketch_merge_rejects_different_gamma() {
+        let mut sketch1 = DataDogSketch::new(0.01);
+        sketch1.add(10.0);
+
+        let mut sketch2 = DataDogSketch::new(0.02); // Different accuracy
+        sketch2.add(20.0);
+
+        let result = sketch1.merge(&sketch2);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("gamma"));
+    }
+
+    #[test]
+    fn test_sketch_merge_rejects_different_index_offset() {
+        let mut sketch1 = DataDogSketch::new(0.01);
+        sketch1.add(10.0);
+
+        let mut sketch2 = DataDogSketch::new(0.01);
+        sketch2.add(20.0);
+        sketch2.index_offset = 5.0; // Different offset
+
+        let result = sketch1.merge(&sketch2);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("index_offset"));
     }
 
     #[test]
