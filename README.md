@@ -171,35 +171,17 @@ FROM (
 
 ### Folding Sketches Across Rows
 
-To merge all sketches in a column into a single result, use a recursive approach or window functions:
+Use `ddsketch_agg` to merge all sketches in a column:
 
 ```sql
--- Using a subquery chain for small datasets
-WITH RECURSIVE merged_sketches AS (
-    -- Base case: first row
-    SELECT
-        sketch,
-        ROW_NUMBER() OVER (ORDER BY hour) as rn
-    FROM hourly_latency_sketches
-    WHERE service = 'api-gateway'
-),
-sketch_fold AS (
-    -- Start with first sketch
-    SELECT sketch, rn FROM merged_sketches WHERE rn = 1
-    UNION ALL
-    -- Merge each subsequent sketch
-    SELECT
-        ddsketch_merge(f.sketch, m.sketch),
-        m.rn
-    FROM sketch_fold f
-    JOIN merged_sketches m ON m.rn = f.rn + 1
-)
+-- Merge all sketches for a service and compute percentiles
 SELECT
-    ddsketch_count(sketch) as total_count,
-    ddsketch_quantile(sketch, 0.95) as p95
-FROM sketch_fold
-ORDER BY rn DESC
-LIMIT 1;
+    service,
+    ddsketch_count(ddsketch_agg(latency_sketch)) as total_count,
+    ddsketch_quantile(ddsketch_agg(latency_sketch), 0.95) as p95
+FROM hourly_latency_sketches
+WHERE service = 'api-gateway'
+GROUP BY service;
 ```
 
 ### Writing Merged Sketches Back to Storage
@@ -207,22 +189,13 @@ LIMIT 1;
 ```sql
 -- Aggregate hourly sketches into daily sketches
 INSERT INTO daily_latency_sketches (day, service, latency_sketch)
-WITH hourly AS (
-    SELECT
-        DATE_TRUNC('day', hour) as day,
-        service,
-        latency_sketch
-    FROM hourly_latency_sketches
-    WHERE hour >= '2024-01-01' AND hour < '2024-01-02'
-)
--- For each service, merge all hourly sketches
 SELECT
-    day,
+    DATE_TRUNC('day', hour) as day,
     service,
-    -- This requires iterative merging; simplified here
-    latency_sketch
-FROM hourly
-GROUP BY day, service;
+    ddsketch_agg(latency_sketch) as latency_sketch
+FROM hourly_latency_sketches
+WHERE hour >= '2024-01-01' AND hour < '2024-01-02'
+GROUP BY DATE_TRUNC('day', hour), service;
 ```
 
 ## Serialization Format
@@ -270,9 +243,19 @@ SELECT ddsketch_count(sketch) FROM sketch_store WHERE id = 1;
 - NaN and infinity values should be filtered before adding
 
 ### Current Limitations
-- No aggregate function for folding sketches (requires manual merging)
 - No direct way to add multiple values in a single call
 - Table function `ddsketch_create` returns a table; use subquery or INSERT to capture
+
+### Aggregate Function
+
+Use `ddsketch_agg(sketch)` to merge multiple sketches:
+
+```sql
+-- Merge all hourly sketches into a daily sketch
+SELECT ddsketch_agg(hourly_sketch) as daily_sketch
+FROM hourly_metrics
+WHERE date = '2024-01-01';
+```
 
 ## Configuration Guidelines
 
