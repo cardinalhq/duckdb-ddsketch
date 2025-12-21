@@ -1,0 +1,22 @@
+# Multi-platform build container for duckdb-ddsketch
+# Build with: docker buildx build --platform linux/amd64,linux/arm64 ...
+FROM rust:1.84-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy source
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+
+# Build release
+RUN cargo build --release
+
+# Export stage
+FROM scratch AS export
+COPY --from=builder /build/target/release/libddsketch.so /

@@ -25,3 +25,8 @@ Thumbs.db
 # Test artifacts
 *.db
 *.wal
+dist/
+*.duckdb_extension
+
+# Core dumps
+*.core

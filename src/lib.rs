@@ -623,7 +623,7 @@ unsafe extern "C" fn sketch_agg_finalize(
                 ffi::duckdb_vector_assign_string_element_len(
                     result,
                     i as ffi::idx_t,
-                    bytes.as_ptr() as *const i8,
+                    bytes.as_ptr() as *const std::ffi::c_char,
                     bytes.len() as ffi::idx_t,
                 );
             }
@@ -693,7 +693,7 @@ unsafe fn register_sketch_agg(raw_con: ffi::duckdb_connection) -> Result<(), Box
 // ============================================================================
 
 /// Minimum DuckDB version required
-const MINIMUM_DUCKDB_VERSION: &str = "v1.2.0";
+const MINIMUM_DUCKDB_VERSION: &str = "v1.4.3";
 
 /// Internal entrypoint with error handling
 unsafe fn extension_entrypoint_internal(

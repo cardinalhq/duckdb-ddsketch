@@ -58,7 +58,7 @@ SELECT sketch FROM ddsketch_create(0.001);
 | `ddsketch_add(sketch, value)` | Adds a value to a sketch, returns the updated sketch. |
 
 **Parameters:**
-- `sketch` (VARCHAR): A serialized DDSketch
+- `sketch` (BLOB): A serialized DDSketch
 - `value` (DOUBLE): The value to add
 
 **Example:**
@@ -73,8 +73,8 @@ UPDATE my_table SET sketch = ddsketch_add(sketch, measurement_value);
 | `ddsketch_merge(sketch1, sketch2)` | Merges two sketches into one, returns the combined sketch. |
 
 **Parameters:**
-- `sketch1` (VARCHAR): First serialized DDSketch
-- `sketch2` (VARCHAR): Second serialized DDSketch
+- `sketch1` (BLOB): First serialized DDSketch
+- `sketch2` (BLOB): Second serialized DDSketch
 
 **Requirements:** Both sketches must have the same relative accuracy configuration.
 
@@ -120,7 +120,7 @@ When you have serialized sketches stored in a table (e.g., pre-aggregated per ti
 CREATE TABLE hourly_latency_sketches (
     hour TIMESTAMP,
     service VARCHAR,
-    latency_sketch VARCHAR  -- serialized DDSketch
+    latency_sketch BLOB  -- serialized DDSketch
 );
 
 -- Merge all sketches for a service over a day
@@ -227,16 +227,16 @@ GROUP BY day, service;
 
 ## Serialization Format
 
-Sketches are serialized using bincode and base64-encoded for storage as VARCHAR. This format is:
-- **Compact**: Typically 1-4 KB per sketch depending on data distribution
-- **Portable**: Can be stored in any text column, JSON field, or file
-- **Deterministic**: Same sketch always produces same serialization
+Sketches are serialized using the **DataDog wire format** and stored as BLOB. This format is:
+- **Compatible**: Matches DataDog Agent's DDSketch serialization exactly
+- **Compact**: Typically 100-500 bytes per sketch depending on data distribution
+- **Binary**: Stored as BLOB for efficient storage in Parquet, database columns, etc.
 
 ```sql
 -- Store sketch in a table
 CREATE TABLE sketch_store (
     id INTEGER,
-    sketch VARCHAR
+    sketch BLOB
 );
 
 INSERT INTO sketch_store
@@ -301,10 +301,63 @@ FROM my_table;
 
 ## Platform Support
 
-- macOS (Apple Silicon / arm64)
-- macOS (Intel / amd64) - coming soon
-- Linux (amd64) - coming soon
-- Linux (arm64) - coming soon
+| Platform | Architecture | Status |
+|----------|--------------|--------|
+| macOS | arm64 (Apple Silicon) | ✅ |
+| macOS | amd64 (Intel) | ✅ |
+| Linux | arm64 | ✅ |
+| Linux | amd64 | ✅ |
+
+## Building from Source
+
+### Prerequisites
+
+- Rust 1.84+ (`rustup update stable`)
+- Python 3 (for extension packaging)
+- Docker (for Linux cross-compilation on macOS)
+
+### Build Commands
+
+```bash
+# Build the shared library
+cargo build --release
+
+# Package as DuckDB extension (macOS arm64 example)
+python3 extension-ci-tools/scripts/append_extension_metadata.py \
+  --library-file target/release/libddsketch.dylib \
+  --extension-name ddsketch \
+  --duckdb-platform osx_arm64 \
+  --duckdb-version v1.4.3 \
+  --extension-version v0.1.0 \
+  --out-file ddsketch.duckdb_extension
+```
+
+### Platform Strings
+
+| Platform | Library | Platform String |
+|----------|---------|-----------------|
+| macOS arm64 | `libddsketch.dylib` | `osx_arm64` |
+| macOS amd64 | `libddsketch.dylib` | `osx_amd64` |
+| Linux arm64 | `libddsketch.so` | `linux_arm64` |
+| Linux amd64 | `libddsketch.so` | `linux_amd64` |
+
+### Cross-Compile for Linux (from macOS)
+
+```bash
+# Build for Linux arm64 (native on ARM Mac, fast)
+./scripts/build-linux.sh arm64
+
+# Build for Linux amd64 (requires x86 machine or CI)
+./scripts/build-linux.sh amd64
+
+# Output in dist/linux-{arch}/libddsketch.so
+```
+
+### Run Tests
+
+```bash
+cargo test
+```
 
 ## License
 
