@@ -327,7 +327,7 @@ python3 extension-ci-tools/scripts/append_extension_metadata.py \
   --library-file target/release/libddsketch.dylib \
   --extension-name ddsketch \
   --duckdb-platform osx_arm64 \
-  --duckdb-version v1.4.3 \
+  --duckdb-version v1.2.0 \
   --extension-version v0.1.0 \
   --out-file ddsketch.duckdb_extension
 ```

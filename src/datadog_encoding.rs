@@ -316,33 +316,10 @@ impl DataDogSketch {
             encode_varfloat64(w, self.zero_count)?;
         }
 
-        // 5. Write sum
-        {
-            let flag = make_flag(FlagType::SketchFeatures, SketchFeatureSubflag::Sum as u8);
-            w.write_all(&[flag])?;
-            encode_float64_le(w, self.sum)?;
-        }
-
-        // 6. Write count
-        {
-            let flag = make_flag(FlagType::SketchFeatures, SketchFeatureSubflag::Count as u8);
-            w.write_all(&[flag])?;
-            encode_varfloat64(w, self.count)?;
-        }
-
-        // 7. Write min if finite
-        if self.min.is_finite() {
-            let flag = make_flag(FlagType::SketchFeatures, SketchFeatureSubflag::Min as u8);
-            w.write_all(&[flag])?;
-            encode_float64_le(w, self.min)?;
-        }
-
-        // 8. Write max if finite
-        if self.max.is_finite() {
-            let flag = make_flag(FlagType::SketchFeatures, SketchFeatureSubflag::Max as u8);
-            w.write_all(&[flag])?;
-            encode_float64_le(w, self.max)?;
-        }
+        // Note: We intentionally do NOT write Sum/Count/Min/Max feature flags.
+        // Go's decoder has a bug where it expects 8 bytes for FlagCount but
+        // the spec says varfloat64. Go never writes these flags itself - it
+        // computes stats from bins on decode. For compatibility, we do the same.
 
         Ok(())
     }
@@ -551,13 +528,17 @@ impl DataDogSketch {
             }
             3 => {
                 // ContiguousCounts
+                // Format: numBins, startIndex, indexDelta, count1, count2, ...
                 let num_bins = decode_uvarint64(r)? as usize;
                 let start_index = decode_varint64(r)? as i32;
+                let index_delta = decode_varint64(r)? as i32;
                 let mut bins = Vec::with_capacity(num_bins);
 
-                for i in 0..num_bins {
+                let mut index = start_index;
+                for _ in 0..num_bins {
                     let count = decode_varfloat64(r)?;
-                    bins.push((start_index + i as i32, count));
+                    bins.push((index, count));
+                    index += index_delta;
                 }
 
                 Ok(bins)
@@ -854,9 +835,11 @@ mod tests {
         // Decode
         let decoded = DataDogSketch::decode(&bytes).unwrap();
 
-        // Check basic properties
+        // Check basic properties - use relative tolerance since sum is computed from bins
         assert_eq!(sketch.count, decoded.count);
-        assert!((sketch.sum - decoded.sum).abs() < 0.01);
+        // Sum computed from bins has ~1% relative accuracy
+        let rel_error = (sketch.sum - decoded.sum).abs() / sketch.sum;
+        assert!(rel_error < 0.02, "sum relative error {} too high", rel_error);
         assert_eq!(sketch.positive_bins.len(), decoded.positive_bins.len());
     }
 
@@ -905,10 +888,15 @@ mod tests {
         let bytes = sketch.encode().unwrap();
         let decoded = DataDogSketch::decode(&bytes).unwrap();
 
-        assert_eq!(decoded.min, 5.5);
-        assert_eq!(decoded.max, 100.25);
+        // Min/max/sum are computed from bins, so use relative tolerance (1% accuracy)
+        let rel_err_min = (decoded.min - 5.5).abs() / 5.5;
+        let rel_err_max = (decoded.max - 100.25).abs() / 100.25;
+        let rel_err_sum = (decoded.sum - 155.75).abs() / 155.75;
+
+        assert!(rel_err_min < 0.02, "min error too high: {}", rel_err_min);
+        assert!(rel_err_max < 0.02, "max error too high: {}", rel_err_max);
         assert_eq!(decoded.count, 3.0);
-        assert_eq!(decoded.sum, 155.75);
+        assert!(rel_err_sum < 0.02, "sum error too high: {}", rel_err_sum);
     }
 }
 
@@ -1093,7 +1081,81 @@ mod compatibility_tests {
         let decoded = DataDogSketch::decode(&bytes).unwrap();
 
         assert_eq!(sketch.count(), decoded.count());
-        assert!(approx_eq(sketch.sum, decoded.sum, 0.0001));
+        // Sum is computed from bins, use relative tolerance
+        let rel_err = (sketch.sum - decoded.sum).abs() / sketch.sum;
+        assert!(rel_err < 0.02, "sum relative error {} too high", rel_err);
         assert_eq!(sketch.positive_bins.len(), decoded.positive_bins.len());
     }
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_contiguous_counts_sketch() {
+        // Sketch with values 51-100 using ContiguousCounts encoding (subflag=3)
+        // Structure: IndexMapping(17) + PositiveStore(1+1+2+1+35) = 57 bytes
+        // The extra byte is indexDelta (02 = 1 in zig-zag varint)
+        let hex_str = "02fd4a815abf52f03f00000000000000000d238803020202020202020203020202030202030202030203020302030302030303020303030302";
+        let bytes = from_hex(hex_str);
+
+        let sketch = DataDogSketch::decode(&bytes).unwrap();
+
+        assert_eq!(bytes.len(), 57);
+        assert_eq!(sketch.positive_bins.len(), 35);
+        assert_eq!(sketch.count as i64, 50);
+        assert!(sketch.sum > 3700.0 && sketch.sum < 3800.0);
+    }
+
+    #[test]
+    fn test_go_generated_roundtrip() {
+        // Decode Go-generated sketch, re-encode with our encoder, decode again
+        // This verifies we write a format that we can read back correctly
+        let hex_str = "02fd4a815abf52f03f00000000000000000d238803020202020202020203020202030202030202030203020302030302030303020303030302";
+        let original_bytes = from_hex(hex_str);
+
+        // First decode
+        let sketch1 = DataDogSketch::decode(&original_bytes).unwrap();
+        let count1 = sketch1.count;
+        let sum1 = sketch1.sum;
+        let bins1 = sketch1.positive_bins.len();
+
+        // Re-encode with our encoder
+        let reencoded = sketch1.encode().unwrap();
+
+        // Decode again
+        let sketch2 = DataDogSketch::decode(&reencoded).unwrap();
+
+        // Verify values match
+        assert_eq!(sketch2.count as i64, count1 as i64, "count mismatch after roundtrip");
+        assert!((sketch2.sum - sum1).abs() < 0.001, "sum mismatch: {} vs {}", sketch2.sum, sum1);
+        assert_eq!(sketch2.positive_bins.len(), bins1, "bins count mismatch");
+
+        // Also verify against expected values
+        assert_eq!(sketch2.count as i64, 50);
+        assert!(sketch2.sum > 3700.0 && sketch2.sum < 3800.0);
+    }
 }
+
+    #[test]
+    fn print_rust_encoded_hex() {
+        // Create same sketches as Go test vectors
+        let mut sketch1 = DataDogSketch::new(0.01);
+        for i in 1..=10 {
+            sketch1.add(i as f64);
+        }
+        let bytes1 = sketch1.encode().unwrap();
+        println!("Rust values 1-10: {}", bytes1.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        println!("  Count: {}, Sum: {}", sketch1.count, sketch1.sum);
+
+        let mut sketch2 = DataDogSketch::new(0.01);
+        sketch2.add(100.0);
+        sketch2.add(200.0);
+        sketch2.add(300.0);
+        let bytes2 = sketch2.encode().unwrap();
+        println!("Rust values 100,200,300: {}", bytes2.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        println!("  Count: {}, Sum: {}", sketch2.count, sketch2.sum);
+    }

@@ -692,8 +692,8 @@ unsafe fn register_sketch_agg(raw_con: ffi::duckdb_connection) -> Result<(), Box
 // Extension entry point
 // ============================================================================
 
-/// Minimum DuckDB version required
-const MINIMUM_DUCKDB_VERSION: &str = "v1.4.3";
+/// Minimum DuckDB C API version required (v1.2.0 is the stable C API)
+const MINIMUM_DUCKDB_VERSION: &str = "v1.2.0";
 
 /// Internal entrypoint with error handling
 unsafe fn extension_entrypoint_internal(
