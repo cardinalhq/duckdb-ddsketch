@@ -9,12 +9,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # DuckDB v1.4.x uses C API version v1.2.0 (not the release version!)
+  DUCKDB_API_VERSION: v1.2.0
+  EXTENSION_VERSION: v0.1.0
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - name: Run tests
         run: cargo test --verbose
@@ -27,25 +32,27 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: linux-amd64
+            platform: linux_amd64
             ext: so
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact: linux-arm64
+            platform: linux_arm64
             ext: so
             cross: true
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: darwin-arm64
+            platform: osx_arm64
             ext: dylib
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: darwin-amd64
+            platform: osx_amd64
             ext: dylib
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -63,16 +70,22 @@ jobs:
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Prepare artifact
+      - name: Package extension
         run: |
-          mkdir -p dist/${{ matrix.artifact }}
-          cp target/${{ matrix.target }}/release/libddsketch.${{ matrix.ext }} dist/${{ matrix.artifact }}/
+          mkdir -p dist
+          python3 extension-ci-tools/scripts/append_extension_metadata.py \
+            --library-file target/${{ matrix.target }}/release/libddsketch.${{ matrix.ext }} \
+            --extension-name ddsketch \
+            --duckdb-platform ${{ matrix.platform }} \
+            --duckdb-version ${{ env.DUCKDB_API_VERSION }} \
+            --extension-version ${{ env.EXTENSION_VERSION }} \
+            --out-file dist/ddsketch-${{ matrix.platform }}.duckdb_extension
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ddsketch-${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}/
+          name: ddsketch-${{ matrix.platform }}
+          path: dist/ddsketch-${{ matrix.platform }}.duckdb_extension
 
   release:
     needs: build
@@ -86,17 +99,11 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create release archives
-        run: |
-          cd artifacts
-          for dir in */; do
-            name="${dir%/}"
-            tar -czvf "${name}.tar.gz" -C "$dir" .
-          done
-          ls -la *.tar.gz
+      - name: List artifacts
+        run: find artifacts -type f
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: artifacts/**/*.duckdb_extension
           generate_release_notes: true
