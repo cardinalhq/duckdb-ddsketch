@@ -273,7 +273,7 @@ impl VTab for QuantileVTab {
             let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
             let value = sketch.quantile(bind_data.quantile)?.unwrap_or(f64::NAN);
 
-            let vector = output.flat_vector(0);
+            let mut vector = output.flat_vector(0);
             vector.as_mut_slice::<f64>()[0] = value;
             output.set_len(1);
         }
@@ -330,7 +330,7 @@ impl VTab for CountVTab {
             let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
             let count = sketch.count() as i64;
 
-            let vector = output.flat_vector(0);
+            let mut vector = output.flat_vector(0);
             vector.as_mut_slice::<i64>()[0] = count;
             output.set_len(1);
         }
@@ -384,7 +384,7 @@ impl VTab for MinVTab {
             let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
             let value = sketch.min().unwrap_or(f64::NAN);
 
-            let vector = output.flat_vector(0);
+            let mut vector = output.flat_vector(0);
             vector.as_mut_slice::<f64>()[0] = value;
             output.set_len(1);
         }
@@ -438,7 +438,7 @@ impl VTab for MaxVTab {
             let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
             let value = sketch.max().unwrap_or(f64::NAN);
 
-            let vector = output.flat_vector(0);
+            let mut vector = output.flat_vector(0);
             vector.as_mut_slice::<f64>()[0] = value;
             output.set_len(1);
         }
@@ -492,7 +492,7 @@ impl VTab for SumVTab {
             let sketch = deserialize_sketch(&bind_data.sketch_encoded)?;
             let value = sketch.sum().unwrap_or(f64::NAN);
 
-            let vector = output.flat_vector(0);
+            let mut vector = output.flat_vector(0);
             vector.as_mut_slice::<f64>()[0] = value;
             output.set_len(1);
         }
@@ -551,7 +551,7 @@ impl VTab for AvgVTab {
                 f64::NAN
             };
 
-            let vector = output.flat_vector(0);
+            let mut vector = output.flat_vector(0);
             vector.as_mut_slice::<f64>()[0] = value;
             output.set_len(1);
         }
