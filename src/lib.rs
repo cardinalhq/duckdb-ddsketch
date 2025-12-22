@@ -807,7 +807,7 @@ unsafe extern "C" fn sketch_agg_finalize(
 // ddsketch_stats_agg: Aggregate returning struct with sketch + percentiles
 // ============================================================================
 
-/// Finalizes aggregate states into a struct result vector with sketch and percentiles
+/// Finalizes aggregate states into a struct result vector with sketch, stats, and percentiles
 unsafe extern "C" fn sketch_stats_agg_finalize(
     _info: ffi::duckdb_function_info,
     source: *mut ffi::duckdb_aggregate_state,
@@ -816,15 +816,25 @@ unsafe extern "C" fn sketch_stats_agg_finalize(
     _offset: ffi::idx_t,
 ) {
     // Get child vectors from the struct vector
-    // Struct order: sketch, p25, p50, p75, p90, p95, p99
+    // Struct order: sketch, count, sum, avg, min, max, p25, p50, p75, p90, p95, p99
     let sketch_vec = ffi::duckdb_struct_vector_get_child(result, 0);
-    let p25_vec = ffi::duckdb_struct_vector_get_child(result, 1);
-    let p50_vec = ffi::duckdb_struct_vector_get_child(result, 2);
-    let p75_vec = ffi::duckdb_struct_vector_get_child(result, 3);
-    let p90_vec = ffi::duckdb_struct_vector_get_child(result, 4);
-    let p95_vec = ffi::duckdb_struct_vector_get_child(result, 5);
-    let p99_vec = ffi::duckdb_struct_vector_get_child(result, 6);
+    let count_vec = ffi::duckdb_struct_vector_get_child(result, 1);
+    let sum_vec = ffi::duckdb_struct_vector_get_child(result, 2);
+    let avg_vec = ffi::duckdb_struct_vector_get_child(result, 3);
+    let min_vec = ffi::duckdb_struct_vector_get_child(result, 4);
+    let max_vec = ffi::duckdb_struct_vector_get_child(result, 5);
+    let p25_vec = ffi::duckdb_struct_vector_get_child(result, 6);
+    let p50_vec = ffi::duckdb_struct_vector_get_child(result, 7);
+    let p75_vec = ffi::duckdb_struct_vector_get_child(result, 8);
+    let p90_vec = ffi::duckdb_struct_vector_get_child(result, 9);
+    let p95_vec = ffi::duckdb_struct_vector_get_child(result, 10);
+    let p99_vec = ffi::duckdb_struct_vector_get_child(result, 11);
 
+    let count_data = ffi::duckdb_vector_get_data(count_vec) as *mut i64;
+    let sum_data = ffi::duckdb_vector_get_data(sum_vec) as *mut f64;
+    let avg_data = ffi::duckdb_vector_get_data(avg_vec) as *mut f64;
+    let min_data = ffi::duckdb_vector_get_data(min_vec) as *mut f64;
+    let max_data = ffi::duckdb_vector_get_data(max_vec) as *mut f64;
     let p25_data = ffi::duckdb_vector_get_data(p25_vec) as *mut f64;
     let p50_data = ffi::duckdb_vector_get_data(p50_vec) as *mut f64;
     let p75_data = ffi::duckdb_vector_get_data(p75_vec) as *mut f64;
@@ -857,7 +867,16 @@ unsafe extern "C" fn sketch_stats_agg_finalize(
                     }
                 }
 
-                // Compute all percentiles in one pass (sketch already deserialized)
+                // Compute all stats in one pass (sketch already in memory)
+                let cnt = sketch.count();
+                let sum = sketch.sum().unwrap_or(f64::NAN);
+                *count_data.add(i) = cnt as i64;
+                *sum_data.add(i) = sum;
+                *avg_data.add(i) = if cnt > 0 { sum / cnt as f64 } else { f64::NAN };
+                *min_data.add(i) = sketch.min().unwrap_or(f64::NAN);
+                *max_data.add(i) = sketch.max().unwrap_or(f64::NAN);
+
+                // Compute all percentiles
                 *p25_data.add(i) = sketch.quantile(0.25).unwrap_or(f64::NAN);
                 *p50_data.add(i) = sketch.quantile(0.50).unwrap_or(f64::NAN);
                 *p75_data.add(i) = sketch.quantile(0.75).unwrap_or(f64::NAN);
@@ -879,11 +898,17 @@ unsafe extern "C" fn sketch_stats_agg_finalize(
 unsafe fn create_stats_agg_return_type() -> ffi::duckdb_logical_type {
     // Create child types
     let blob_type = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
+    let bigint_type = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT);
     let double_type = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE);
 
-    // Field names
+    // Field names: sketch, count, sum, avg, min, max, p25, p50, p75, p90, p95, p99
     let names = [
         CString::new("sketch").unwrap(),
+        CString::new("count").unwrap(),
+        CString::new("sum").unwrap(),
+        CString::new("avg").unwrap(),
+        CString::new("min").unwrap(),
+        CString::new("max").unwrap(),
         CString::new("p25").unwrap(),
         CString::new("p50").unwrap(),
         CString::new("p75").unwrap(),
@@ -893,25 +918,31 @@ unsafe fn create_stats_agg_return_type() -> ffi::duckdb_logical_type {
     ];
     let name_ptrs: Vec<*const std::ffi::c_char> = names.iter().map(|n| n.as_ptr()).collect();
 
-    // Field types (sketch is BLOB, rest are DOUBLE)
+    // Field types
     let types = [
-        blob_type,
-        double_type,
-        double_type,
-        double_type,
-        double_type,
-        double_type,
-        double_type,
+        blob_type,    // sketch
+        bigint_type,  // count
+        double_type,  // sum
+        double_type,  // avg
+        double_type,  // min
+        double_type,  // max
+        double_type,  // p25
+        double_type,  // p50
+        double_type,  // p75
+        double_type,  // p90
+        double_type,  // p95
+        double_type,  // p99
     ];
 
     let struct_type = ffi::duckdb_create_struct_type(
         types.as_ptr() as *mut ffi::duckdb_logical_type,
         name_ptrs.as_ptr() as *mut *const std::ffi::c_char,
-        7,
+        12,
     );
 
     // Cleanup child types
     ffi::duckdb_destroy_logical_type(&mut { blob_type });
+    ffi::duckdb_destroy_logical_type(&mut { bigint_type });
     ffi::duckdb_destroy_logical_type(&mut { double_type });
 
     struct_type

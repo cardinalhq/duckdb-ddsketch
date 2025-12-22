@@ -262,10 +262,12 @@ FROM hourly_metrics
 WHERE date = '2024-01-01';
 ```
 
-**ddsketch_stats_agg** - Merge with percentiles computed in one pass (recommended for efficiency):
+**ddsketch_stats_agg** - Merge with all stats computed in one pass (recommended for efficiency):
 
 ```sql
--- Returns STRUCT(sketch BLOB, p25, p50, p75, p90, p95, p99 DOUBLE)
+-- Returns STRUCT(sketch BLOB, count BIGINT, sum DOUBLE, avg DOUBLE,
+--                min DOUBLE, max DOUBLE, p25 DOUBLE, p50 DOUBLE,
+--                p75 DOUBLE, p90 DOUBLE, p95 DOUBLE, p99 DOUBLE)
 SELECT
     service,
     ddsketch_stats_agg(latency_sketch) as stats
@@ -275,10 +277,14 @@ GROUP BY service;
 -- Access individual fields
 SELECT
     service,
-    stats.p50 as median,
-    stats.p95 as p95,
-    stats.p99 as p99,
-    ddsketch_count(stats.sketch) as sample_count
+    stats.count,
+    stats.sum,
+    stats.avg,
+    stats.min,
+    stats.max,
+    stats.p50,
+    stats.p95,
+    stats.p99
 FROM (
     SELECT service, ddsketch_stats_agg(latency_sketch) as stats
     FROM hourly_metrics
@@ -286,7 +292,7 @@ FROM (
 );
 ```
 
-This avoids deserializing the merged sketch multiple times when extracting multiple percentiles.
+This computes all stats and percentiles in one pass, avoiding repeated deserialization.
 
 ## Configuration Guidelines
 
