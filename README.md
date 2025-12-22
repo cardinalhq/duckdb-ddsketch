@@ -246,9 +246,14 @@ SELECT ddsketch_count(sketch) FROM sketch_store WHERE id = 1;
 - No direct way to add multiple values in a single call
 - Table function `ddsketch_create` returns a table; use subquery or INSERT to capture
 
-### Aggregate Function
+### Aggregate Functions
 
-Use `ddsketch_agg(sketch)` to merge multiple sketches:
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `ddsketch_agg(sketch)` | BLOB | Merges multiple sketches into one |
+| `ddsketch_stats_agg(sketch)` | STRUCT | Merges sketches and returns struct with sketch + percentiles |
+
+**ddsketch_agg** - Simple merge returning the merged sketch:
 
 ```sql
 -- Merge all hourly sketches into a daily sketch
@@ -256,6 +261,32 @@ SELECT ddsketch_agg(hourly_sketch) as daily_sketch
 FROM hourly_metrics
 WHERE date = '2024-01-01';
 ```
+
+**ddsketch_stats_agg** - Merge with percentiles computed in one pass (recommended for efficiency):
+
+```sql
+-- Returns STRUCT(sketch BLOB, p25, p50, p75, p90, p95, p99 DOUBLE)
+SELECT
+    service,
+    ddsketch_stats_agg(latency_sketch) as stats
+FROM hourly_metrics
+GROUP BY service;
+
+-- Access individual fields
+SELECT
+    service,
+    stats.p50 as median,
+    stats.p95 as p95,
+    stats.p99 as p99,
+    ddsketch_count(stats.sketch) as sample_count
+FROM (
+    SELECT service, ddsketch_stats_agg(latency_sketch) as stats
+    FROM hourly_metrics
+    GROUP BY service
+);
+```
+
+This avoids deserializing the merged sketch multiple times when extracting multiple percentiles.
 
 ## Configuration Guidelines
 

@@ -803,6 +803,160 @@ unsafe extern "C" fn sketch_agg_finalize(
     }
 }
 
+// ============================================================================
+// ddsketch_stats_agg: Aggregate returning struct with sketch + percentiles
+// ============================================================================
+
+/// Finalizes aggregate states into a struct result vector with sketch and percentiles
+unsafe extern "C" fn sketch_stats_agg_finalize(
+    _info: ffi::duckdb_function_info,
+    source: *mut ffi::duckdb_aggregate_state,
+    result: ffi::duckdb_vector,
+    count: ffi::idx_t,
+    _offset: ffi::idx_t,
+) {
+    // Get child vectors from the struct vector
+    // Struct order: sketch, p25, p50, p75, p90, p95, p99
+    let sketch_vec = ffi::duckdb_struct_vector_get_child(result, 0);
+    let p25_vec = ffi::duckdb_struct_vector_get_child(result, 1);
+    let p50_vec = ffi::duckdb_struct_vector_get_child(result, 2);
+    let p75_vec = ffi::duckdb_struct_vector_get_child(result, 3);
+    let p90_vec = ffi::duckdb_struct_vector_get_child(result, 4);
+    let p95_vec = ffi::duckdb_struct_vector_get_child(result, 5);
+    let p99_vec = ffi::duckdb_struct_vector_get_child(result, 6);
+
+    let p25_data = ffi::duckdb_vector_get_data(p25_vec) as *mut f64;
+    let p50_data = ffi::duckdb_vector_get_data(p50_vec) as *mut f64;
+    let p75_data = ffi::duckdb_vector_get_data(p75_vec) as *mut f64;
+    let p90_data = ffi::duckdb_vector_get_data(p90_vec) as *mut f64;
+    let p95_data = ffi::duckdb_vector_get_data(p95_vec) as *mut f64;
+    let p99_data = ffi::duckdb_vector_get_data(p99_vec) as *mut f64;
+
+    for i in 0..count as usize {
+        let state_ptr = *source.add(i) as *mut SketchAggState;
+        let state = &*state_ptr;
+
+        match state.get_sketch() {
+            Some(sketch) => {
+                // Serialize sketch
+                match serialize_sketch(sketch) {
+                    Some(bytes) => {
+                        ffi::duckdb_vector_assign_string_element_len(
+                            sketch_vec,
+                            i as ffi::idx_t,
+                            bytes.as_ptr() as *const std::ffi::c_char,
+                            bytes.len() as ffi::idx_t,
+                        );
+                    }
+                    None => {
+                        // Set entire struct row as NULL on encoding failure
+                        ffi::duckdb_vector_ensure_validity_writable(result);
+                        let validity = ffi::duckdb_vector_get_validity(result);
+                        ffi::duckdb_validity_set_row_invalid(validity, i as ffi::idx_t);
+                        continue;
+                    }
+                }
+
+                // Compute all percentiles in one pass (sketch already deserialized)
+                *p25_data.add(i) = sketch.quantile(0.25).unwrap_or(f64::NAN);
+                *p50_data.add(i) = sketch.quantile(0.50).unwrap_or(f64::NAN);
+                *p75_data.add(i) = sketch.quantile(0.75).unwrap_or(f64::NAN);
+                *p90_data.add(i) = sketch.quantile(0.90).unwrap_or(f64::NAN);
+                *p95_data.add(i) = sketch.quantile(0.95).unwrap_or(f64::NAN);
+                *p99_data.add(i) = sketch.quantile(0.99).unwrap_or(f64::NAN);
+            }
+            None => {
+                // Return NULL for empty aggregation
+                ffi::duckdb_vector_ensure_validity_writable(result);
+                let validity = ffi::duckdb_vector_get_validity(result);
+                ffi::duckdb_validity_set_row_invalid(validity, i as ffi::idx_t);
+            }
+        }
+    }
+}
+
+/// Create a struct logical type for stats_agg return value
+unsafe fn create_stats_agg_return_type() -> ffi::duckdb_logical_type {
+    // Create child types
+    let blob_type = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
+    let double_type = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE);
+
+    // Field names
+    let names = [
+        CString::new("sketch").unwrap(),
+        CString::new("p25").unwrap(),
+        CString::new("p50").unwrap(),
+        CString::new("p75").unwrap(),
+        CString::new("p90").unwrap(),
+        CString::new("p95").unwrap(),
+        CString::new("p99").unwrap(),
+    ];
+    let name_ptrs: Vec<*const std::ffi::c_char> = names.iter().map(|n| n.as_ptr()).collect();
+
+    // Field types (sketch is BLOB, rest are DOUBLE)
+    let types = [
+        blob_type,
+        double_type,
+        double_type,
+        double_type,
+        double_type,
+        double_type,
+        double_type,
+    ];
+
+    let struct_type = ffi::duckdb_create_struct_type(
+        types.as_ptr() as *mut ffi::duckdb_logical_type,
+        name_ptrs.as_ptr() as *mut *const std::ffi::c_char,
+        7,
+    );
+
+    // Cleanup child types
+    ffi::duckdb_destroy_logical_type(&mut { blob_type });
+    ffi::duckdb_destroy_logical_type(&mut { double_type });
+
+    struct_type
+}
+
+/// Register the ddsketch_stats_agg aggregate function
+unsafe fn register_sketch_stats_agg(raw_con: ffi::duckdb_connection) -> Result<(), Box<dyn Error>> {
+    let agg_func = ffi::duckdb_create_aggregate_function();
+
+    let name = CString::new("ddsketch_stats_agg").unwrap();
+    ffi::duckdb_aggregate_function_set_name(agg_func, name.as_ptr());
+
+    // Add parameter (BLOB for serialized sketch)
+    let blob_type = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
+    ffi::duckdb_aggregate_function_add_parameter(agg_func, blob_type);
+    ffi::duckdb_destroy_logical_type(&mut { blob_type });
+
+    // Set return type (STRUCT with sketch and percentiles)
+    let return_type = create_stats_agg_return_type();
+    ffi::duckdb_aggregate_function_set_return_type(agg_func, return_type);
+    ffi::duckdb_destroy_logical_type(&mut { return_type });
+
+    // Set functions - reuse state/init/update/combine from ddsketch_agg
+    ffi::duckdb_aggregate_function_set_functions(
+        agg_func,
+        Some(sketch_agg_state_size),
+        Some(sketch_agg_init),
+        Some(sketch_agg_update),
+        Some(sketch_agg_combine),
+        Some(sketch_stats_agg_finalize), // Different finalize
+    );
+
+    ffi::duckdb_aggregate_function_set_destructor(agg_func, Some(sketch_agg_destroy));
+    ffi::duckdb_aggregate_function_set_special_handling(agg_func);
+
+    let result = ffi::duckdb_register_aggregate_function(raw_con, agg_func);
+    ffi::duckdb_destroy_aggregate_function(&mut { agg_func });
+
+    if result != ffi::duckdb_state_DuckDBSuccess {
+        return Err("Failed to register ddsketch_stats_agg".into());
+    }
+
+    Ok(())
+}
+
 /// Register the ddsketch_agg aggregate function using raw connection pointer
 unsafe fn register_sketch_agg(raw_con: ffi::duckdb_connection) -> Result<(), Box<dyn Error>> {
     // Create the aggregate function
@@ -880,8 +1034,9 @@ unsafe fn extension_entrypoint_internal(
         return Err("Failed to create connection for aggregate registration".into());
     }
 
-    // Register aggregate function using the raw connection
+    // Register aggregate functions using the raw connection
     register_sketch_agg(raw_con)?;
+    register_sketch_stats_agg(raw_con)?;
 
     // Disconnect the temporary connection
     ffi::duckdb_disconnect(&mut raw_con);
