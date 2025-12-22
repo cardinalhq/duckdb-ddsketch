@@ -1,4 +1,4 @@
-.PHONY: clean clean_all configure debug release test test_debug test_release
+.PHONY: clean clean_all configure debug release test test_debug test_release check
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -30,3 +30,8 @@ test_release: test_extension_release
 
 clean: clean_build clean_rust
 clean_all: clean_configure clean
+
+# Full check: build, run unit tests, run integration tests
+check: release
+	cargo test
+	./test/run_integration_tests.sh
