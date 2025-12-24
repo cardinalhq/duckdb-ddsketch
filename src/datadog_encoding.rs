@@ -1354,22 +1354,171 @@ mod compatibility_tests {
     }
 }
 
-    #[test]
-    fn print_rust_encoded_hex() {
-        // Create same sketches as Go test vectors
-        let mut sketch1 = DataDogSketch::new(0.01);
-        for i in 1..=10 {
-            sketch1.add(i as f64);
-        }
-        let bytes1 = sketch1.encode().unwrap();
-        println!("Rust values 1-10: {}", bytes1.iter().map(|b| format!("{:02x}", b)).collect::<String>());
-        println!("  Count: {}, Sum: {}", sketch1.count, sketch1.sum);
+// ============================================================================
+// Production Data Tests
+// Test vectors from production parquet file to identify decode issues
+// ============================================================================
+#[cfg(test)]
+mod production_tests {
+    use super::*;
 
-        let mut sketch2 = DataDogSketch::new(0.01);
-        sketch2.add(100.0);
-        sketch2.add(200.0);
-        sketch2.add(300.0);
-        let bytes2 = sketch2.encode().unwrap();
-        println!("Rust values 100,200,300: {}", bytes2.iter().map(|b| format!("{:02x}", b)).collect::<String>());
-        println!("  Count: {}, Sum: {}", sketch2.count, sketch2.sum);
+    include!("sketch_test_data.rs");
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
+
+    #[test]
+    fn test_decode_all_production_sketches() {
+        let mut failures = Vec::new();
+        let mut successes = 0;
+
+        for (i, (expected_sum, expected_count, hex_data)) in TEST_SKETCHES.iter().enumerate() {
+            let bytes = hex_decode(hex_data);
+            match DataDogSketch::decode(&bytes) {
+                Ok(sketch) => {
+                    // Check count matches exactly
+                    if (sketch.count - expected_count).abs() > 0.001 {
+                        failures.push(format!(
+                            "Sketch {}: count mismatch - expected {}, got {}",
+                            i, expected_count, sketch.count
+                        ));
+                        continue;
+                    }
+
+                    // Check sum with tolerance (sum is computed from bins, so some error expected)
+                    if *expected_sum != 0.0 {
+                        let rel_error = (sketch.sum - expected_sum).abs() / expected_sum.abs();
+                        if rel_error > 0.05 {
+                            failures.push(format!(
+                                "Sketch {}: sum mismatch - expected {}, got {} (rel_error: {:.2}%)",
+                                i, expected_sum, sketch.sum, rel_error * 100.0
+                            ));
+                            continue;
+                        }
+                    } else if sketch.sum.abs() > 0.001 {
+                        failures.push(format!(
+                            "Sketch {}: sum should be 0, got {}",
+                            i, sketch.sum
+                        ));
+                        continue;
+                    }
+
+                    successes += 1;
+                }
+                Err(e) => {
+                    failures.push(format!(
+                        "Sketch {}: decode failed - {} (hex: {})",
+                        i, e, hex_data
+                    ));
+                }
+            }
+        }
+
+        println!("Decoded {} sketches successfully", successes);
+        if !failures.is_empty() {
+            println!("\nFailures ({}):", failures.len());
+            for f in &failures[..failures.len().min(20)] {
+                println!("  {}", f);
+            }
+            if failures.len() > 20 {
+                println!("  ... and {} more", failures.len() - 20);
+            }
+            panic!("{} sketches failed validation", failures.len());
+        }
+    }
+
+    #[test]
+    fn test_decode_production_sketches_individually() {
+        // Test each sketch one at a time with detailed output on failure
+        for (i, (expected_sum, expected_count, hex_data)) in TEST_SKETCHES.iter().enumerate() {
+            let bytes = hex_decode(hex_data);
+            let sketch = DataDogSketch::decode(&bytes)
+                .unwrap_or_else(|e| panic!("Sketch {} decode failed: {} (hex: {})", i, e, hex_data));
+
+            assert!(
+                (sketch.count - expected_count).abs() < 0.001,
+                "Sketch {}: count mismatch - expected {}, got {}",
+                i, expected_count, sketch.count
+            );
+            if *expected_sum != 0.0 {
+                let rel_error = (sketch.sum - expected_sum).abs() / expected_sum.abs();
+                assert!(
+                    rel_error < 0.05,
+                    "Sketch {}: sum mismatch - expected {}, got {} (rel_error: {:.2}%)",
+                    i, expected_sum, sketch.sum, rel_error * 100.0
+                );
+            } else {
+                assert!(
+                    sketch.sum.abs() < 0.001,
+                    "Sketch {}: sum should be 0, got {}",
+                    i, sketch.sum
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_all_production_sketches() {
+        // Try to merge all sketches into one - this is what ddsketch_stats_agg does
+        println!("Merging {} sketches...", TEST_SKETCHES.len());
+
+        let mut merged: Option<DataDogSketch> = None;
+
+        for (i, (_expected_sum, _expected_count, hex_data)) in TEST_SKETCHES.iter().enumerate() {
+            let bytes = hex_decode(hex_data);
+            let sketch = DataDogSketch::decode(&bytes)
+                .unwrap_or_else(|e| panic!("Sketch {} decode failed: {}", i, e));
+
+            match &mut merged {
+                None => merged = Some(sketch),
+                Some(m) => {
+                    if let Err(e) = m.merge(&sketch) {
+                        panic!("Merge failed at sketch {}: {}", i, e);
+                    }
+                }
+            }
+
+            if i % 1000 == 0 {
+                println!("Merged {} sketches, current count: {}", i + 1, merged.as_ref().unwrap().count);
+            }
+        }
+
+        let final_sketch = merged.unwrap();
+        println!("Final merged sketch: count={}, sum={}", final_sketch.count, final_sketch.sum);
+    }
+
+    #[test]
+    fn test_merge_batches_to_find_problematic_sketch() {
+        // Merge in batches of 100 to narrow down problematic ranges
+        println!("Testing merge in batches of 100...");
+
+        for batch_start in (0..TEST_SKETCHES.len()).step_by(100) {
+            let batch_end = (batch_start + 100).min(TEST_SKETCHES.len());
+            let mut merged: Option<DataDogSketch> = None;
+
+            for i in batch_start..batch_end {
+                let (_expected_sum, _expected_count, hex_data) = &TEST_SKETCHES[i];
+                let bytes = hex_decode(hex_data);
+                let sketch = DataDogSketch::decode(&bytes)
+                    .unwrap_or_else(|e| panic!("Sketch {} decode failed: {}", i, e));
+
+                match &mut merged {
+                    None => merged = Some(sketch),
+                    Some(m) => {
+                        if let Err(e) = m.merge(&sketch) {
+                            panic!("Batch {}-{}: merge failed at sketch {}: {}", batch_start, batch_end, i, e);
+                        }
+                    }
+                }
+            }
+
+            println!("Batch {}-{}: OK, merged count={}", batch_start, batch_end, merged.unwrap().count);
+        }
+
+        println!("All batches merged successfully!");
+    }
+}
