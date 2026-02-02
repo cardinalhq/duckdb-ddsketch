@@ -1,6 +1,6 @@
 [package]
 name = "ddsketch"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "DuckDB extension for DDSketch quantile sketches"
 license = "Apache-2.0"
@@ -19,5 +19,5 @@ path = "src/wasm_lib.rs"
 crate-type = ["staticlib"]
 
 [dependencies]
-duckdb = { version = "=1.4.3", features = ["vtab-loadable", "vscalar"] }
-libduckdb-sys = { version = "=1.4.3", features = ["loadable-extension"] }
+duckdb = { version = "=1.4.4", features = ["vtab-loadable", "vscalar"] }
+libduckdb-sys = { version = "=1.4.4", features = ["loadable-extension"] }
